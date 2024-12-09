@@ -1,0 +1,339 @@
+---
+title: "final thca"
+output: html_document
+date: "2024-12-09"
+---
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+
+```{r}
+# Download and load libraries
+if (!require("knitr", quietly = TRUE))
+  install.packages("knitr")
+
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install(version = "3.19")
+
+if (!require("TCGAbiolinks", quietly = TRUE))
+  BiocManager::install("TCGAbiolinks")
+
+if (!require("maftools", quietly = TRUE))
+  BiocManager::install("maftools")
+
+if (!require("survival", quietly = TRUE))
+  BiocManager::install("survival")
+
+if (!require("survminer", quietly = TRUE))
+  BiocManager::install("survminer")
+
+if (!require("ggplot2", quietly = TRUE))
+  BiocManager::install("ggplot2")
+
+if (!require("DESeq2", quietly = TRUE))
+BiocManager::install("DESeq2")
+if (!require("EnhancedVolcano", quietly = TRUE))
+BiocManager::install("EnhancedVolcano")
+
+library(BiocManager)
+library(TCGAbiolinks)
+library(maftools)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(DESeq2)
+library(EnhancedVolcano)
+```
+
+```{r setup}
+# set root directory
+knitr::opts_knit$set(root.dir = normalizePath("/home1/rszhang/490_cluster/qbio490_fa24_final_thca"))
+```
+
+```{r}
+# create the output folder
+subfolder <- "outputs"
+dir.create(subfolder)
+```
+
+
+```{r}
+# load data
+clin_query <- GDCquery(project = "TCGA-THCA",
+                       data.category = "Clinical",
+                       data.type = "Clinical Supplement",
+                       data.format = 'BCR Biotab')
+GDCdownload(clin_query)
+clinical.BCRtab.all <- GDCprepare(clin_query)
+clinic <- clinical.BCRtab.all$clinical_patient_thca[-c(1,2),]
+
+rna_query <- GDCquery(project ="TCGA-THCA",
+                      data.category = "Transcriptome Profiling",
+                      data.type = "Gene Expression Quantification",
+                      workflow.type = "STAR - Counts")
+GDCdownload(rna_query)
+rna_se <- GDCprepare(rna_query)
+
+```
+
+```{r}
+# create data frames from RNA Summarized Experiment
+rna_clinical <- as.data.frame(rna_se@colData)
+rna_genes <- as.data.frame(rna_se@rowRanges@elementMetadata)
+rna_counts <- as.data.frame(rna_se@assays@data$unstranded)
+rna_tpm <- as.data.frame(rna_se@assays@data$tpm_unstrand)
+
+#mask for normal tissues and remove them from the rna clinical dataframe
+normal_mask <- rna_clinical$definition == "Solid Tissue Normal"
+rna_clinical <- rna_clinical[!normal_mask,]
+rna_counts <- rna_counts[,!normal_mask]
+rna_tpm <- rna_tpm[,!normal_mask]
+counts_mask <- rowSums(rna_counts) >= 1000
+```
+
+```{r}
+#Replication of K-M plots from Wan et al., looped for all 8 hub genes
+# Gene of interest and thresholds
+hub_genes <- c("FN1", "CCND1", "CDH2", "CXCL12", "MET", "IRS1", "DCN", "FMOD")
+for (gene in hub_genes){
+gene_of_interest <- gene
+#set cutoffs; we used quintiles
+high_cutoff <- 0.80
+low_cutoff <- 1-high_cutoff
+
+# Select the gene and calculate thresholds
+gene_mask <- rna_genes$gene_name == gene_of_interest
+gene_high_cutoff <- quantile(as.numeric(rna_tpm[gene_mask, ]), high_cutoff)
+gene_low_cutoff <- quantile(as.numeric(rna_tpm[gene_mask, ]), low_cutoff)
+
+# Assign categories based on thresholds
+rna_clinical$gene_category <- ifelse(as.numeric(rna_tpm[gene_mask, ]) >= gene_high_cutoff, 
+                                     "High", 
+                                     ifelse(as.numeric(rna_tpm[gene_mask, ]) <= gene_low_cutoff, 
+                                            "Low", 
+                                            "Neutral"))
+rna_clinical$gene_category <- factor(rna_clinical$gene_category)
+rna_clinical <- rna_clinical[!is.na(rna_clinical$gene_category), ]
+
+# Ensure patient barcodes are consistent
+rna_clinical$patient_barcode <- substr(rownames(rna_clinical), 1, 12)
+clinic$patient_barcode <- substr(clinic$bcr_patient_barcode, 1, 12)
+
+# Merge clinical and RNA-seq data
+merged_data <- merge(clinic, rna_clinical, by = "patient_barcode")
+filtered_data <- merged_data[merged_data$gene_category %in% c("High", "Low"), ]
+
+# Calculate survival time and death event
+filtered_data$survival_time <- ifelse(!filtered_data$death_days_to == "[Not Applicable]",
+                                      as.numeric(filtered_data$death_days_to),
+                                      as.numeric(filtered_data$last_contact_days_to))
+filtered_data$death_event <- ifelse(filtered_data$vital_status.x == "Dead", 1, 0)
+
+# Create survival object and fit curves
+survival_object <- Surv(time = filtered_data$survival_time, event = filtered_data$death_event)
+fit <- survfit(survival_object ~ gene_category, data = filtered_data)
+
+# Calculate `n` for each group dynamically
+n_high <- sum(filtered_data$gene_category == "High")
+n_low <- sum(filtered_data$gene_category == "Low")
+
+# Create dynamic labels
+legend_title <- paste0(gene_of_interest, " Expression")
+legend_labels <- c(
+  paste0("High ", gene_of_interest, " Expression (n = ", n_high, ")"),
+  paste0("Low ", gene_of_interest, " Expression (n = ", n_low, ")")
+)
+
+# Plot KM curve with dynamic labels
+survplot <- ggsurvplot(
+  fit,
+  pval = TRUE,
+  ggtheme = theme_minimal(),
+  legend.title = legend_title,
+  legend.labs = legend_labels
+)
+
+# Customize the plot further
+KM_plot <- survplot$plot +
+  theme_bw() +
+  theme(
+    axis.title = element_text(size = 20),
+    axis.text = element_text(size = 16),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 12)
+  )
+
+KM_plot
+# Specify the subfolder path
+
+# Save the plot in the subfolder
+plotname = paste0("KM plot for ", gene_of_interest,".jpg")
+ggsave(filename = file.path(subfolder, plotname))
+}
+```
+```{r}
+#find threshold values with the lowest p values
+hub_genes <- c("FN1", "CCND1", "CDH2", "CXCL12", "MET", "IRS1", "DCN", "FMOD")
+for (gene in hub_genes){
+gene_of_interest <- gene
+
+# Select the gene
+gene_mask <- rna_genes$gene_name == gene_of_interest
+gene_expression <- as.numeric(rna_tpm[gene_mask, ])
+
+# Define quantile thresholds to test
+thresholds <- seq(0.5, 0.9, by = 0.001)  # Quantiles from 0.1 to 0.9 in steps of 0.05
+p_values <- numeric(length(thresholds))  # To store p-values
+
+# Loop over thresholds and perform survival analysis
+# Suppress the warnings, otherwise the whole screen will be warnings
+suppressWarnings({
+for (i in seq_along(thresholds)) {
+  high_cutoff <- quantile(gene_expression, thresholds[i])
+  low_cutoff <- quantile(gene_expression, 1 - thresholds[i])
+  
+  # Categorize patients
+  rna_clinical$gene_category <- ifelse(gene_expression >= high_cutoff, "High",
+                                       ifelse(gene_expression <= low_cutoff, "Low", "Neutral"))
+  rna_clinical$gene_category <- factor(rna_clinical$gene_category)
+  
+  # Filter for High and Low groups only
+  filtered_data <- rna_clinical[!is.na(rna_clinical$gene_category) & 
+                                  rna_clinical$gene_category %in% c("High", "Low"), ]
+  
+  # Merge with clinical data
+  filtered_data$patient_barcode <- substr(rownames(filtered_data), 1, 12)
+  clinic$patient_barcode <- substr(clinic$bcr_patient_barcode, 1, 12)
+  merged_data <- merge(clinic, filtered_data, by = "patient_barcode")
+  
+  # Calculate survival time and death event
+  merged_data$survival_time <- ifelse(!merged_data$death_days_to == "[Not Applicable]",
+                                      as.numeric(merged_data$death_days_to),
+                                      as.numeric(merged_data$last_contact_days_to))
+  merged_data$death_event <- ifelse(merged_data$vital_status.y == "Dead", 1, 0)
+  
+  # Perform survival analysis
+  survival_object <- Surv(time = merged_data$survival_time, event = merged_data$death_event)
+  fit <- survfit(survival_object ~ gene_category, data = merged_data)
+  surv_diff <- survdiff(survival_object ~ gene_category, data = merged_data)
+  
+  # Extract p-value
+  p_values[i] <- 1 - pchisq(surv_diff$chisq, df = length(surv_diff$n) - 1)
+}
+
+# Make sure the plot gets saved in the subfolder
+subfolder <- "outputs"
+
+
+# Save the plot in the subfolder
+# Create unique plotname for each since we iterate through genes
+plotname = paste0("p-value vs High Threshold for ", gene_of_interest,".png")
+
+file_path <- file.path(subfolder, plotname)
+# save the graph as a png
+png(file_path, width = 800, height = 600)
+# Plot p-values vs thresholds
+plot<-plot(thresholds, p_values, type = "b", pch = 19, col = "blue",
+     xlab = "Quantile Threshold", ylab = "p-value",
+     main = paste0("p-value vs High Threshold for ", gene_of_interest))
+abline(h = 0.0625, col = "red", lty = 2)  # Add significance threshold line
+#close the png
+dev.off()
+
+})
+}
+
+```
+
+```{r}
+#Boolean masking to create upper and lower DCN cutoffs
+gene_mask <- rna_genes$gene_name == "DCN"
+gene_high_cutoff = quantile(as.numeric(rna_tpm[gene_mask,]), 0.75)
+gene_low_cutoff = quantile(as.numeric(rna_tpm[gene_mask,]), 0.25)
+rna_clinical$DCN_category <- ifelse(as.numeric(rna_tpm[gene_mask,]) >= gene_high_cutoff, "High", ifelse(as.numeric(rna_tpm[gene_mask,]) <= gene_low_cutoff, "Low", "Neutral"))
+High_low_intialcount <- rna_clinical$DCN_category
+```
+
+
+```{r}
+# Set DCN as Variable of interest 
+rna_clinical$DCN_category <-factor(rna_clinical$DCN_category)
+
+colnames(rna_counts) <- row.names(rna_clinical)
+
+# Create DESEQ dataset
+dds <- DESeqDataSetFromMatrix(countData = rna_counts, colData = rna_clinical, design = ~DCN_category)
+
+dds_object <- DESeq(dds)
+
+```
+
+
+```{r}
+# Prepare Volcano Plot Arguments
+results <- results(dds_object,
+                   format = "DataFrame",
+                   contrast = c("DCN_category","High","Low"))
+
+results <- data.frame(rna_genes$gene_name,results$log2FoldChange, results$pvalue, results$padj, -log10(results$padj))
+colnames(results) <- c("gene_name", "log2FC", "pval", "padj", '-log10(padj)')
+```
+
+
+```{r}
+# Create Volcano Plot
+EnhancedVolcano(
+  results,
+  lab=results$gene_name,
+  x = 'log2FC',
+  y = '-log10(padj)',
+  ylim = c(0,5),
+  xlim = c(-5,5),
+  pCutoff = 2,
+  FCcutoff = 1.0,
+  title = 'Volcano Plot: High vs Low Expression of DCN',
+  xlab = 'Log2 Fold Change',
+  ylab = '-Log10 Adjusted aP-value',
+  col = c('gray','blue','red','darkgreen')
+  
+)
+```
+
+
+```{r}
+# Create masks to filter genes that are statistically significant and have a sufficiently high log2 fold change
+sig_mask <- results$padj < 0.001
+up_fc_mask <- results$log2FC > 2
+upregulated_results <- results[sig_mask & up_fc_mask, ]
+upregulated_results <- upregulated_results[!is.na(upregulated_results$gene_name), c('gene_name', 'log2FC')]
+
+# Sort upregulated results by log2FC in decreasing order
+upregulated_results <- upregulated_results[order(upregulated_results$log2FC, decreasing = TRUE), ]
+
+# Filter downregulated results
+down_fc_mask <- results$log2FC < -2
+downregulated_results <- results[sig_mask & down_fc_mask, ]
+downregulated_results <- downregulated_results[!is.na(downregulated_results$gene_name), c('gene_name', 'log2FC')]
+
+# Sort downregulated results by log2FC in increasing order (most downregulated first)
+downregulated_results <- downregulated_results[order(downregulated_results$log2FC), ]
+
+# Extract top 50 gene names
+top_upregulated <- head(upregulated_results$gene_name, 50)
+top_downregulated <- head(downregulated_results$gene_name, 50)
+
+# Create strings separated by spaces
+upregulated_string <- paste(top_upregulated, collapse = " ")
+downregulated_string <- paste(top_downregulated, collapse = " ")
+
+# Output strings to be easier for simpler input into Panthers
+cat("Top 50 upregulated genes:\n", upregulated_string, "\n")
+cat("Top 50 downregulated genes:\n", downregulated_string, "\n")
+```
